@@ -35,6 +35,36 @@ from collections import defaultdict, deque
 from email.utils import parsedate_to_datetime
 from typing import Any, cast
 
+import litellm
+from litellm.exceptions import APIError as LiteLLMAPIError
+from litellm.exceptions import RateLimitError as LiteLLMRateLimitError
+
+
+_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+
+def split_thinking(text: str) -> tuple[str, str]:
+    """Return (response, reasoning_content).
+
+    Mirrors evals/repos/IFBench/generate_responses.py:
+      1. <think>...</think> present — split as usual.
+      2. Only </think> present — everything before becomes reasoning, after becomes response.
+      3. Neither tag — warn and treat the whole text as response.
+    """
+    match = _THINK_RE.search(text)
+    if match is not None:
+        return text[match.end():].strip(), match.group(1).strip()
+    parts = text.split("</think>", 1)
+    if len(parts) == 2:
+        return parts[1].strip(), parts[0].replace("<think>", "").strip()
+    print(
+        f"WARNING: thinking split failed — no </think> in response "
+        f"(len={len(text)}, head={text[:80]!r})",
+        file=sys.stderr,
+        flush=True,
+    )
+    return text.strip(), ""
+
 
 DEFAULT_RESPONSE_SYSTEM_PROMPT = "You are a helpful assistant."
 EMPTY_MODEL_RESPONSE_PLACEHOLDER = "[Model returned an empty response.]"
@@ -286,7 +316,7 @@ COLLECT_DEFAULTS: dict[str, Any] = {
     "limit": 0,
     "techniques": "",
     "temperature": None,
-    "max_tokens": 0,
+    "max_tokens": 4096,
     "empty_response_retries": 2,
     "pause_seconds": 0.0,
     "retries": 3,
@@ -445,8 +475,30 @@ def parse_args() -> argparse.Namespace:
         help="Collect model responses for benchmark questions (stateless requests).",
     )
     collect.add_argument("--questions", default="questions.json")
-    collect.add_argument("--models", default="")
-    collect.add_argument("--models-file", default="")
+    collect.add_argument(
+        "--model",
+        default="",
+        help="The single model under evaluation. Replaces config.collect.models.",
+    )
+    collect.add_argument(
+        "--api-base",
+        default="",
+        help=(
+            "OpenAI-compatible base URL (e.g. http://node:8000/v1) for generation. "
+            "When set, the --model is sent as `hosted_vllm/<model>` with this base, "
+            "regardless of model_providers config."
+        ),
+    )
+    collect.add_argument(
+        "--api-key",
+        default="",
+        help="API key for --api-base.",
+    )
+    collect.add_argument(
+        "--api-key-env",
+        default="",
+        help="Env var name holding the API key for --api-base (alternative to --api-key).",
+    )
     collect.add_argument(
         "--model-providers",
         default="",
@@ -492,7 +544,7 @@ def parse_args() -> argparse.Namespace:
     collect.add_argument("--limit", type=int, default=0)
     collect.add_argument("--techniques", default="")
     collect.add_argument("--temperature", type=float, default=None)
-    collect.add_argument("--max-tokens", type=int, default=0,
+    collect.add_argument("--max-tokens", type=int, default=4096,
                          help="Max response tokens. 0 = no limit (omit from API call).")
     collect.add_argument(
         "--empty-response-retries",
@@ -633,6 +685,13 @@ def parse_args() -> argparse.Namespace:
     )
     grade.add_argument("--judge-model", default="")
     grade.add_argument(
+        "--judge-api-base",
+        default="",
+        help="API base URL for the judge (required when not --dry-run). "
+             "Forwarded to litellm.completion; pair with a model string whose "
+             "litellm provider prefix matches the endpoint protocol.",
+    )
+    grade.add_argument(
         "--model-providers",
         default="",
         help=(
@@ -751,6 +810,13 @@ def parse_args() -> argparse.Namespace:
         "--judge-models",
         default="",
         help="Comma-separated judge models.",
+    )
+    grade_panel.add_argument(
+        "--judge-api-bases",
+        default="",
+        help="Comma-separated API base URLs, one per --judge-models entry "
+             "(required when not --dry-run; csv length must match the number "
+             "of judges).",
     )
     grade_panel.add_argument(
         "--model-providers",
@@ -2563,6 +2629,130 @@ class OpenAIResponsesClient:
         raise last_error
 
 
+class LiteLLMClient:
+    """Single client for all API calls. api_base is always required.
+
+    Model-string resolution:
+      - If the model carries a litellm provider prefix (vertex_ai/,
+        anthropic/, openai/, openrouter/, gemini/, ...), pass through.
+        api_base is forwarded to litellm.completion as a custom endpoint
+        for that provider.
+      - Otherwise the model is sent as `hosted_vllm/<model>` (vLLM /
+        OpenAI-compatible servers).
+    """
+
+    _LITELLM_PROVIDER_PREFIXES = (
+        "vertex_ai/", "anthropic/", "openai/", "openrouter/", "gemini/",
+        "azure/", "bedrock/", "hosted_vllm/", "ollama/", "fireworks_ai/",
+        "together_ai/", "groq/", "deepseek/", "cohere/", "mistral/",
+    )
+
+    def __init__(
+        self,
+        *,
+        api_base: str,
+        api_key: str = "",
+        timeout_seconds: int,
+    ) -> None:
+        if timeout_seconds < 1:
+            raise ValueError("timeout_seconds must be >= 1")
+        if not api_base:
+            raise ValueError("api_base is required")
+        self.api_base = api_base
+        self.api_key = api_key
+        self.timeout_seconds = timeout_seconds
+
+    def _resolve_model(self, model: str) -> str:
+        if model.startswith(self._LITELLM_PROVIDER_PREFIXES):
+            return model
+        return f"hosted_vllm/{model}"
+
+    def chat(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, str]],
+        temperature: float | None,
+        max_tokens: int,
+        retries: int,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if retries < 1:
+            raise ValueError("retries must be >= 1")
+
+        resolved = self._resolve_model(model)
+        kwargs: dict[str, Any] = {
+            "model": resolved,
+            "messages": messages,
+            "timeout": self.timeout_seconds,
+            "api_base": self.api_base,
+        }
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        if max_tokens > 0:
+            kwargs["max_tokens"] = max_tokens
+        if extra_payload:
+            reasoning = extra_payload.get("reasoning")
+            if isinstance(reasoning, dict) and reasoning.get("effort"):
+                kwargs["reasoning_effort"] = reasoning["effort"]
+            # response_format becomes a top-level litellm kwarg so it gets
+            # translated per provider (e.g. converted to Anthropic tool_use
+            # for vertex_ai/...). Sending it via extra_body raw would forward
+            # it to the underlying API verbatim and fail on non-OpenAI providers.
+            response_format = extra_payload.get("response_format")
+            if response_format is not None:
+                kwargs["response_format"] = response_format
+            # OpenRouter-only routing hints — drop unless we're actually
+            # going through openrouter.
+            is_openrouter = resolved.startswith("openrouter/")
+            extra_body = {}
+            for k, v in extra_payload.items():
+                if k in {"reasoning", "response_format"}:
+                    continue
+                if k == "provider" and not is_openrouter:
+                    continue
+                extra_body[k] = v
+            if extra_body:
+                kwargs["extra_body"] = extra_body
+
+        last_error: Exception | None = None
+        for attempt in range(1, retries + 1):
+            try:
+                response = litellm.completion(**kwargs)
+                return response.model_dump()
+            except LiteLLMRateLimitError as exc:
+                last_error = OpenRouterAPIError(
+                    f"rate-limited by provider (attempt {attempt}/{retries}): {exc}",
+                    status_code=429,
+                    retryable=True,
+                    retry_after_seconds=None,
+                )
+            except LiteLLMAPIError as exc:
+                status = getattr(exc, "status_code", 0) or 0
+                retryable = is_retryable_http_status(status)
+                last_error = OpenRouterAPIError(
+                    f"HTTP {status} from litellm (attempt {attempt}/{retries})"
+                    f"{' [retryable]' if retryable else ' [non-retryable]'}: {exc}",
+                    status_code=status,
+                    retryable=retryable,
+                    retry_after_seconds=None,
+                )
+                if not retryable:
+                    raise last_error from exc
+            except Exception as exc:  # pylint: disable=broad-except
+                last_error = RuntimeError(
+                    f"litellm call failed (attempt {attempt}/{retries}): {exc}"
+                )
+
+            if attempt < retries:
+                time.sleep(compute_retry_delay_seconds(attempt, None))
+
+        assert last_error is not None
+        raise last_error
+
+
 def extract_model_text(api_response: dict[str, Any]) -> str:
     if api_response.get("error"):
         err = api_response.get("error")
@@ -2719,7 +2909,7 @@ def build_collect_tasks(
 def collect_one(
     task: dict[str, Any],
     *,
-    clients: dict[str, Any] | None,
+    client: "LiteLLMClient | None",
     system_prompt: str,
     omit_system_prompt: bool,
     temperature: float | None,
@@ -2778,6 +2968,7 @@ def collect_one(
         "stateless_request": True,
         "request_messages": request_messages if store_request_messages else [],
         "response_text": "",
+        "reasoning_content": "",
         "response_id": "",
         "response_usage": {},
         "response_latency_ms": None,
@@ -2810,14 +3001,8 @@ def collect_one(
                 "choices": [{"finish_reason": "stop"}],
             }
         else:
-            if clients is None:
-                raise RuntimeError("No provider clients are configured.")
-            client = clients.get(model_provider)
             if client is None:
-                raise RuntimeError(
-                    f"No client configured for model_provider={model_provider} "
-                    f"(model_id={task.get('model_id', task['model'])})."
-                )
+                raise RuntimeError("No client is configured.")
             extra_payload: dict[str, Any] | None = None
             if effort_value is not None:
                 extra_payload = {
@@ -2925,7 +3110,9 @@ def collect_one(
                     )
                 break
 
+        response_text, reasoning_content = split_thinking(response_text)
         record["response_text"] = response_text
+        record["reasoning_content"] = reasoning_content
         record["response_id"] = str(payload.get("id", ""))
         record["response_created"] = payload.get("created", payload.get("created_at"))
         record["response_usage"] = payload.get("usage", {})
@@ -2968,6 +3155,9 @@ def run_collect(args: argparse.Namespace) -> int:
         raise ValueError("--parallelism must be >= 1")
     if args.max_inflight_per_model < 0:
         raise ValueError("--max-inflight-per-model must be >= 0")
+    # Single-model mode: don't let max_inflight_per_model bottleneck against parallelism.
+    if args.max_inflight_per_model and args.max_inflight_per_model < args.parallelism:
+        args.max_inflight_per_model = args.parallelism
     if args.rate_limit_max_attempts < 1:
         raise ValueError("--rate-limit-max-attempts must be >= 1")
     if args.rate_limit_cooldown_seconds < 0:
@@ -2982,7 +3172,9 @@ def run_collect(args: argparse.Namespace) -> int:
         raise ValueError("--empty-response-retries must be >= 0")
     validate_retry_and_timeout(args.retries, args.timeout_seconds)
 
-    models = load_models(args.models, args.models_file)
+    if not args.model.strip():
+        raise ValueError("--model is required (single model under evaluation).")
+    models = [args.model.strip()]
     base_reasoning_effort = normalize_reasoning_effort(
         args.response_reasoning_effort, field_name="--response-reasoning-effort"
     )
@@ -3006,7 +3198,7 @@ def run_collect(args: argparse.Namespace) -> int:
         for unknown_model in unknown_reasoning_models:
             per_model_reasoning_efforts.pop(unknown_model, None)
         print(
-            "Ignoring config model_reasoning_efforts for models not in current --models "
+            "Ignoring config model_reasoning_efforts for models not in current --model "
             f"selection: {', '.join(sorted(unknown_reasoning_models))}",
             flush=True,
         )
@@ -3027,7 +3219,7 @@ def run_collect(args: argparse.Namespace) -> int:
             model_request_overrides.pop(unknown_model, None)
         print(
             "Ignoring config model_request_overrides for models not in current "
-            f"--models selection: {', '.join(sorted(unknown_override_models))}",
+            f"--model selection: {', '.join(sorted(unknown_override_models))}",
             flush=True,
         )
     model_variants = build_model_variants(
@@ -3150,37 +3342,23 @@ def run_collect(args: argparse.Namespace) -> int:
         collect_events_path.write_text("", encoding="utf-8")
     elif not collect_events_path.exists():
         collect_events_path.write_text("", encoding="utf-8")
-    clients: dict[str, Any] | None = None
+    client: LiteLLMClient | None = None
     if not args.dry_run:
-        providers_in_use = {
-            str(variant.get("model_provider", DEFAULT_MODEL_PROVIDER)).strip().lower()
-            for variant in model_variants
-        }
-        clients = {}
-        if "openrouter" in providers_in_use:
-            openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-            if not openrouter_key:
-                raise RuntimeError(
-                    "OPENROUTER_API_KEY is required for models routed to openrouter "
-                    "unless --dry-run is set."
-                )
-            clients["openrouter"] = OpenRouterClient(
-                api_key=openrouter_key,
-                timeout_seconds=args.timeout_seconds,
-            )
-        if "openai" in providers_in_use:
-            openai_key = os.getenv("OPENAI_API_KEY", "").strip()
-            if not openai_key:
-                raise RuntimeError(
-                    "OPENAI_API_KEY is required for models routed to openai "
-                    "unless --dry-run is set."
-                )
-            clients["openai"] = OpenAIResponsesClient(
-                api_key=openai_key,
-                timeout_seconds=args.timeout_seconds,
-                project_id=openai_project_id,
-                organization_id=openai_organization_id,
-            )
+        api_base = (getattr(args, "api_base", "") or "").strip()
+        if not api_base:
+            raise ValueError("--api-base is required for collect.")
+        api_key = (getattr(args, "api_key", "") or "").strip()
+        api_key_env = (getattr(args, "api_key_env", "") or "").strip()
+        if not api_key and api_key_env:
+            api_key = os.getenv(api_key_env, "").strip()
+        if not api_key:
+            # vLLM doesn't require a real key; satisfy `Authorization: Bearer ...`.
+            api_key = "EMPTY"
+        client = LiteLLMClient(
+            api_base=api_base,
+            api_key=api_key,
+            timeout_seconds=args.timeout_seconds,
+        )
 
     started = time.perf_counter()
     records: list[dict[str, Any]] = list(checkpoint_records)
@@ -3272,7 +3450,7 @@ def run_collect(args: argparse.Namespace) -> int:
                     future = pool.submit(
                         collect_one,
                         task,
-                        clients=clients,
+                        client=client,
                         system_prompt=args.response_system_prompt,
                         omit_system_prompt=omit_system_prompt,
                         temperature=args.temperature,
@@ -3632,7 +3810,7 @@ def pick_judge_response_format(judge_model: str, *, allow_score_3: bool = True) 
 def grade_one(
     response_row: dict[str, Any],
     *,
-    clients: dict[str, Any] | None,
+    client: "LiteLLMClient | None",
     judge_model: str,
     judge_provider: str,
     judge_system_prompt: str,
@@ -3743,14 +3921,8 @@ def grade_one(
                 grade_row["judge_response_created"] = None
                 grade_row["judge_finish_reason"] = "stop"
             else:
-                if clients is None:
-                    raise RuntimeError("No provider clients are configured.")
-                client = clients.get(judge_provider)
                 if client is None:
-                    raise RuntimeError(
-                        f"No client configured for judge_provider={judge_provider} "
-                        f"(judge_model={judge_model})."
-                    )
+                    raise RuntimeError("No client is configured.")
                 judge_response_format = pick_judge_response_format(
                     judge_model,
                     allow_score_3=bool(grade_row["is_control"]),
@@ -4253,33 +4425,15 @@ def run_grade(args: argparse.Namespace) -> int:
         },
     )
 
-    clients: dict[str, Any] | None = None
+    client: LiteLLMClient | None = None
     if not args.dry_run:
-        clients = {}
-        if judge_provider == "openrouter":
-            openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-            if not openrouter_key:
-                raise RuntimeError(
-                    "OPENROUTER_API_KEY is required for judge models routed to openrouter "
-                    "unless --dry-run is set."
-                )
-            clients["openrouter"] = OpenRouterClient(
-                api_key=openrouter_key,
-                timeout_seconds=args.timeout_seconds,
-            )
-        elif judge_provider == "openai":
-            openai_key = os.getenv("OPENAI_API_KEY", "").strip()
-            if not openai_key:
-                raise RuntimeError(
-                    "OPENAI_API_KEY is required for judge models routed to openai "
-                    "unless --dry-run is set."
-                )
-            clients["openai"] = OpenAIResponsesClient(
-                api_key=openai_key,
-                timeout_seconds=args.timeout_seconds,
-                project_id=openai_project_id,
-                organization_id=openai_organization_id,
-            )
+        judge_api_base = (getattr(args, "judge_api_base", "") or "").strip()
+        if not judge_api_base:
+            raise ValueError("--judge-api-base is required for grade.")
+        client = LiteLLMClient(
+            api_base=judge_api_base,
+            timeout_seconds=args.timeout_seconds,
+        )
 
     started = time.perf_counter()
     grade_rows: list[dict[str, Any]] = list(checkpoint_rows)
@@ -4295,7 +4449,7 @@ def run_grade(args: argparse.Namespace) -> int:
                 future = pool.submit(
                     grade_one,
                     row,
-                    clients=clients,
+                    client=client,
                     judge_model=args.judge_model,
                     judge_provider=judge_provider,
                     judge_system_prompt=judge_system,
@@ -4466,6 +4620,7 @@ def _build_grade_args(
     *,
     responses_file: pathlib.Path,
     judge_model: str,
+    judge_api_base: str,
     output_dir: pathlib.Path,
     grade_id: str,
     resume: bool,
@@ -4474,6 +4629,7 @@ def _build_grade_args(
         command="grade",
         responses_file=str(responses_file),
         judge_model=judge_model,
+        judge_api_base=judge_api_base,
         model_providers=panel_args.model_providers,
         config=panel_args.config,
         output_dir=str(output_dir),
@@ -4503,6 +4659,7 @@ def _run_grade_for_panel(
     *,
     responses_file: pathlib.Path,
     judge_model: str,
+    judge_api_base: str,
     output_dir: pathlib.Path,
     grade_id: str,
 ) -> pathlib.Path:
@@ -4512,6 +4669,7 @@ def _run_grade_for_panel(
         panel_args,
         responses_file=responses_file,
         judge_model=judge_model,
+        judge_api_base=judge_api_base,
         output_dir=output_dir,
         grade_id=grade_id,
         resume=resume_this_grade,
@@ -4531,19 +4689,28 @@ def _run_primary_judges_for_panel(
     panel_dir: pathlib.Path,
     panel_id: str,
     primary_judges: list[str],
+    judge_api_bases: list[str],
 ) -> list[pathlib.Path]:
+    if len(judge_api_bases) != len(primary_judges):
+        raise ValueError(
+            f"judge_api_bases length ({len(judge_api_bases)}) must match "
+            f"primary_judges length ({len(primary_judges)})."
+        )
     judge_specs = [
-        (idx, judge, f"{panel_id}__judge{idx}_{to_slug(judge)}")
-        for idx, judge in enumerate(primary_judges, start=1)
+        (idx, judge, api_base, f"{panel_id}__judge{idx}_{to_slug(judge)}")
+        for idx, (judge, api_base) in enumerate(
+            zip(primary_judges, judge_api_bases), start=1
+        )
     ]
     if not bool(panel_args.parallel_primary_judges):
         ordered_dirs: list[pathlib.Path] = []
-        for _, judge, grade_id in judge_specs:
+        for _, judge, api_base, grade_id in judge_specs:
             ordered_dirs.append(
                 _run_grade_for_panel(
                     panel_args,
                     responses_file=responses_file,
                     judge_model=judge,
+                    judge_api_base=api_base,
                     output_dir=panel_dir,
                     grade_id=grade_id,
                 )
@@ -4560,10 +4727,11 @@ def _run_primary_judges_for_panel(
                 panel_args,
                 responses_file=responses_file,
                 judge_model=judge,
+                judge_api_base=api_base,
                 output_dir=panel_dir,
                 grade_id=grade_id,
             ): idx
-            for idx, judge, grade_id in judge_specs
+            for idx, judge, api_base, grade_id in judge_specs
         }
         try:
             for future in concurrent.futures.as_completed(future_map):
@@ -4573,7 +4741,7 @@ def _run_primary_judges_for_panel(
             for future in future_map:
                 future.cancel()
             raise
-    return [ordered_dirs_by_idx[idx] for idx, _, _ in judge_specs]
+    return [ordered_dirs_by_idx[idx] for idx, _, _, _ in judge_specs]
 
 
 def _valid_judge_score(row: dict[str, Any] | None) -> int | None:
@@ -4918,6 +5086,23 @@ def run_grade_panel(args: argparse.Namespace) -> int:
         raise ValueError("responses file is empty.")
 
     judge_models = dedupe_preserve_order(split_csv(args.judge_models))
+    judge_api_bases = [s.strip() for s in split_csv(getattr(args, "judge_api_bases", "") or "")]
+    if not args.dry_run:
+        if not judge_api_bases:
+            raise ValueError(
+                "--judge-api-bases is required for grade-panel (csv, one per "
+                "--judge-models entry)."
+            )
+        if len(judge_api_bases) != len(judge_models):
+            raise ValueError(
+                f"--judge-api-bases length ({len(judge_api_bases)}) must match "
+                f"--judge-models length ({len(judge_models)})."
+            )
+        if any(not b for b in judge_api_bases):
+            raise ValueError("--judge-api-bases entries must all be non-empty.")
+    else:
+        # Dry-run still needs a list to zip against; pad with empties.
+        judge_api_bases = [""] * len(judge_models)
     tiebreaker_model = args.tiebreaker_model.strip()
 
     if not judge_models and not tiebreaker_model:
@@ -4969,6 +5154,7 @@ def run_grade_panel(args: argparse.Namespace) -> int:
         panel_dir=panel_dir,
         panel_id=panel_id,
         primary_judges=judges_to_run_full,
+        judge_api_bases=judge_api_bases,
     )
 
     primary_grade_dirs = grade_dirs_for_aggregate[:2]
