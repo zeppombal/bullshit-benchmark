@@ -2643,7 +2643,7 @@ class LiteLLMClient:
 
     _LITELLM_PROVIDER_PREFIXES = (
         "vertex_ai/", "anthropic/", "openai/", "openrouter/", "gemini/",
-        "azure/", "bedrock/", "hosted_vllm/", "ollama/", "fireworks_ai/",
+        "azure/", "bedrock/", "hosted_vllm/", "litellm_proxy/", "ollama/", "fireworks_ai/",
         "together_ai/", "groq/", "deepseek/", "cohere/", "mistral/",
     )
 
